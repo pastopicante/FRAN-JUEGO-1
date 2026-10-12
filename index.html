@@ -474,7 +474,7 @@
   <div id="screen-menu" class="screen">
     <div class="header-box">
       <h1 class="title">FRAN BATTLE 3D</h1>
-      <p class="subtitle">CARRERA POR LA GRAN ESTRELLA</p>
+      <p class="subtitle">CARRERA POR LA GRAN ESTRELLA · VERSIÓN 4 JUGADORES</p>
     </div>
 
     <div class="modal-card">
@@ -1368,6 +1368,7 @@
 
     function restartMatch() {
       if (isMultiplayer) {
+        clearInterval(startRetry); pendingGame = null; matchId = null;
         stopMatch(); hideAllScreens(); document.getElementById('screen-multiplayer').classList.remove('hidden');
         ready = true; announce(); updateLobbyUI();
       } else startMatch();
@@ -1376,6 +1377,7 @@
     /* ==========================================================================
        CONEXIÓN MULTIJUGADOR INSTANTÁNEA (MQTT OVER WEBSOCKETS)
        ========================================================================== */
+    let pendingGame = null, loadedPlayers = new Set(), loadDeadline = 0, startRetry = null;
     let roomEpoch = 0, heartbeat = null, connected = false, ready = true;
     let joinedAt = 0, hostId = null, matchId = null, matchRoster = [], roomSince = 0;
     function status(text, kind = 'waiting') {
@@ -1384,6 +1386,7 @@
     }
     function leaveRoom() {
       if (connected) sendNetMessage({type:'leave'});
+      clearInterval(startRetry); startRetry = null; pendingGame = null; loadedPlayers.clear();
       roomEpoch++; connected = false; clearInterval(heartbeat); heartbeat = null;
       if (mqttClient) { mqttClient.onConnectionLost = () => {}; try { mqttClient.disconnect(); } catch {} }
       mqttClient = null; knownPeers.clear(); hostId = null; isHost = false; matchId = null; matchRoster = [];
@@ -1416,7 +1419,7 @@
           mqttClient = client;
           client.onConnectionLost = () => {
             if (epoch !== roomEpoch) return;
-            connected = false; clearInterval(heartbeat); stopMatch();
+            connected = false; clearInterval(heartbeat); clearInterval(startRetry); pendingGame = null; stopMatch();
             hideAllScreens(); document.getElementById('screen-multiplayer').classList.remove('hidden');
             status('Se cortó la conexión. Salí y volvé a entrar.','error'); updateLobbyUI();
           };
@@ -1426,7 +1429,7 @@
           };
           client.connect({useSSL:true,timeout:8,onSuccess:() => {
             if (epoch !== roomEpoch) { client.disconnect(); return; }
-            client.subscribe('fran-battle-v2/' + room,{qos:0,onSuccess:() => {
+            client.subscribe('fran-battle-v3/' + room,{qos:1,onSuccess:() => {
               if (epoch !== roomEpoch) return;
               connected = true; announce(); sendNetMessage({type:'hello'});
               heartbeat = setInterval(() => {
@@ -1445,7 +1448,7 @@
       if (!mqttClient || !mqttClient.isConnected()) return;
       try {
         const msg = new Paho.MQTT.Message(JSON.stringify({...payload,senderId:myClientId,matchId:payload.matchId || matchId}));
-        msg.destinationName = 'fran-battle-v2/' + roomCode;
+        msg.destinationName = 'fran-battle-v3/' + roomCode;
         msg.qos = payload.type === 'pos' ? 0 : 1;
         mqttClient.send(msg);
       } catch(e) { console.warn('No se pudo enviar',e.message); }
@@ -1455,7 +1458,8 @@
       knownPeers.delete(id);
       const index = players.findIndex(p => p.id === id);
       if (index > 0) { scene.remove(playerMeshes[index]); playerMeshes.splice(index,1); players.splice(index,1); }
-      if (wasHost && matchRunning) {
+      if (wasHost && (matchRunning || pendingGame)) {
+        clearInterval(startRetry); pendingGame = null; matchId = null;
         stopMatch(); hideAllScreens(); document.getElementById('screen-multiplayer').classList.remove('hidden');
         ready = true; announce();
       }
@@ -1472,13 +1476,20 @@
       knownPeers.get(data.senderId).seen = Date.now();
       if (data.type === 'leave') { removePeer(data.senderId); updateLobbyUI(); return; }
       if (data.type === 'init_game') {
-        if (data.senderId !== hostId || data.matchId === matchId || !Array.isArray(data.roster) || data.roster.length > 4 || !data.roster.some(p => p.id === myClientId)) return;
+        if (data.senderId !== hostId || !Array.isArray(data.roster) || data.roster.length > 4 || !data.roster.some(p => p.id === myClientId)) return;
         if (!Array.isArray(data.grid) || data.grid.length !== MAZE_SIZE || data.grid.some(row => !Array.isArray(row) || row.length !== MAZE_SIZE || row.some(v => v!==0 && v!==1))) return;
         if (!data.star || !Number.isInteger(data.star.x) || !Number.isInteger(data.star.z) || data.grid[data.star.z]?.[data.star.x] !== 0) return;
         if (data.roster.some(p => typeof p.id !== 'string' || !Number.isInteger(p.charIndex) || p.charIndex < 0 || p.charIndex > 3)) return;
-        beginOnline(data); return;
+        if (data.matchId === matchId) { sendNetMessage({type:'loaded'}); return; }
+        prepareOnline(data); return;
       }
-      if (!matchRunning || data.matchId !== matchId) return;
+      if (data.matchId !== matchId) return;
+      if (data.type === 'loaded' && isHost && pendingGame) {
+        loadedPlayers.add(data.senderId); maybeStartOnline(); return;
+      }
+      if (data.type === 'start' && data.senderId === hostId && pendingGame) { releaseOnline(); return; }
+      if (data.type === 'cancel_start' && data.senderId === hostId && pendingGame) { cancelOnlineStart('La carga se interrumpió. Volvé a iniciar.'); return; }
+      if (!matchRunning) return;
       if (data.type === 'pos') {
         const remote = players.find(p => p.id === data.senderId);
         if (!remote || !Number.isFinite(data.x) || !Number.isFinite(data.z) || checkWallCollision(data.x,data.z)) return;
@@ -1488,14 +1499,55 @@
         const winner = players.find(p => p.id === data.id); if (winner) triggerVictory(winner);
       }
     }
-    function beginOnline(data) {
+    function prepareOnline(data) {
+      pendingGame = data; loadedPlayers = new Set(); loadDeadline = Date.now()+25000;
       matchId = data.matchId; mazeGrid = data.grid; starPos = data.star; matchRoster = data.roster;
-      const oldPeers = knownPeers; knownPeers = new Map();
+      knownPeers = new Map();
       for (const p of matchRoster) if (p.id !== myClientId) knownPeers.set(p.id,{...p,seen:Date.now()});
-      ready = false; startMatch(); announce();
+      ready = false;
+      try {
+        startMatch(); matchRunning = false;
+        camera.position.set(localPlayer.x,22,localPlayer.z+9);
+        camera.lookAt(localPlayer.x,1.5,localPlayer.z);
+        renderer.render(scene,camera);
+        hideAllScreens(); document.getElementById('screen-multiplayer').classList.remove('hidden');
+        loadedPlayers.add(myClientId); sendNetMessage({type:'loaded'}); announce();
+        clearInterval(startRetry);
+        startRetry = setInterval(() => {
+          if (!pendingGame) return;
+          if (Date.now()>loadDeadline) {
+            if (isHost) sendNetMessage({type:'cancel_start'});
+            cancelOnlineStart('No cargaron todos. Revisá la conexión y volvé a iniciar.'); return;
+          }
+          if (isHost) { sendNetMessage(pendingGame); maybeStartOnline(); }
+          else sendNetMessage({type:'loaded'});
+        },1000);
+        updateLobbyUI(); maybeStartOnline();
+      } catch(e) {
+        console.error('Error cargando partida',e);
+        if (isHost) sendNetMessage({type:'cancel_start'});
+        cancelOnlineStart('No se pudo cargar el mapa. Recargá la página e intentá otra vez.');
+      }
+    }
+    function maybeStartOnline() {
+      if (!isHost || !pendingGame || !matchRoster.every(p=>loadedPlayers.has(p.id))) return;
+      sendNetMessage({type:'start'}); releaseOnline();
+    }
+    function releaseOnline() {
+      clearInterval(startRetry); startRetry = null; pendingGame = null;
+      hideAllScreens();
+      document.getElementById('hud').classList.remove('hidden');
+      document.getElementById(isTouchDevice?'touch-controls':'play-help').classList.remove('hidden');
+      matchStartTime = performance.now(); matchWon = false; matchRunning = true;
+    }
+    function cancelOnlineStart(message) {
+      clearInterval(startRetry); startRetry = null; pendingGame = null; matchId = null;
+      stopMatch(); ready = true; announce(); hideAllScreens();
+      document.getElementById('screen-multiplayer').classList.remove('hidden');
+      updateLobbyUI(); status(message,'error');
     }
     function updateLobbyUI() {
-      const members = roster(); hostId = members[0].id; isHost = hostId === myClientId;
+      const members = roster(); if (!matchRunning && !pendingGame) hostId = members[0].id; isHost = hostId === myClientId;
       document.getElementById('player-count').textContent = members.length;
       const list = document.getElementById('lobby-player-list'); list.replaceChildren();
       for (const p of members) {
@@ -1503,9 +1555,10 @@
         row.textContent = (p.id === hostId ? '👑 ' : '') + p.name + (p.id === myClientId ? ' (vos)' : '') + (p.ready ? ' · Listo' : ' · En partida'); list.appendChild(row);
       }
       const btn = document.getElementById('start-online-btn');
-      btn.disabled = !connected || !isHost || members.length < 2 || members.length > 4 || members.some(p => !p.ready) || Date.now()-roomSince < 2200;
+      btn.disabled = !!pendingGame || !connected || !isHost || members.length < 2 || members.length > 4 || members.some(p => !p.ready) || Date.now()-roomSince < 2200;
       btn.style.opacity = btn.disabled ? '.5' : '1';
       btn.textContent = isHost ? '🔥 ¡INICIAR PARTIDA!' : 'Esperando al anfitrión…';
+      if (pendingGame) { status('Cargando mapa: '+(isHost ? loadedPlayers.size+'/'+matchRoster.length : 'esperando a los demás')+'…'); return; }
       if (connected) status(members.length > 4 ? 'Sala llena: máximo 4 jugadores.' : members.length < 2 ? 'Conectado. Compartí el enlace con un amigo.' : members.some(p => !p.ready) ? 'Esperando que todos vuelvan a la sala…' : members.length + ' jugadores conectados. '+(isHost ? 'Podés iniciar.' : 'El anfitrión inicia.'), members.length > 4 ? 'error' : 'connected');
     }
     async function copyRoomLink() {
@@ -1517,7 +1570,7 @@
       updateLobbyUI(); if (document.getElementById('start-online-btn').disabled) return;
       const maze = generateMaze(MAZE_SIZE);
       const data = {type:'init_game',matchId:myClientId+'_'+Date.now(),grid:maze.grid,star:maze.star,roster:roster()};
-      sendNetMessage(data); beginOnline(data);
+      sendNetMessage(data); prepareOnline(data);
     }
     function findRoute(x,z) {
       const half = MAZE_SIZE*CELL_SIZE/2;
